@@ -1,12 +1,12 @@
 """Polymarket next-NVIDIA-CEO forecaster (Python 3.13, stdlib only).
 
-Method (validated on the 6 practice cases, pinball loss 0.2776 vs house
-baseline 0.363589, top dev entry 0.190, v1 0.2848, v2 0.2813):
+Method (validated on the 6 practice cases, pinball loss 0.2722 vs house
+baseline 0.363589, top dev entry 0.190, v1 0.2848, v2 0.2813, v3 0.2776):
   - Forecast in logit space: the Yes price is a probability, so a symmetric
     random walk in logit space becomes the right skewed spread in price
     space (a small market can double far more easily than it can halve).
   - Two-component normal mixture in logit space, per sqrt-minute:
-    85% narrow (sigma 0.014) + 15% wide (sigma 0.08). The mixture's
+    85% narrow (sigma 0.014) + 15% wide (sigma 0.10). The mixture's
     quantiles are Z_MIX below (precomputed by bisection on the mixture CDF,
     verified CDF(Z_MIX) == tau). This gives a narrow centre with heavy
     tails, matching the data: median |240-min move| is only 0.003, but
@@ -18,21 +18,30 @@ baseline 0.363589, top dev entry 0.190, v1 0.2848, v2 0.2813):
     logit of the last 24 hours (1440 min). A 24h anchor beats 6h (0.2848)
     and 48h/72h (0.288/0.292); the price reverts toward its longer-term
     level, not just the last few hours.
-  - q_tau(h) = sigmoid(logit(x) + drift*h/60 + Z_MIX[tau] * sqrt(h)),
+  - Level-dependent spread: narrower near p=0.5, wider near 0 or 1
+    (k=-3.5). A market near 0.5 has its logit anchored; near 0 or 1 a
+    small price move is a big logit move.
+  - Age-dependent spread: younger markets are more volatile. The youngest
+    third of markets (avg age 7.6h) moves 2x as much over 240 min as the
+    oldest third (avg 55.7h). scale *= 1 + 0.6/sqrt(age_hours), so a
+    1-hour-old market gets ~1.6x spread and a 2-day-old market ~1.08x.
+    Tested k in [0, 2]; k=0.6 is best (0.2722 vs 0.2776 at k=0).
+  - q_tau(h) = sigmoid(logit(x) + drift*h/60 + Z_MIX[tau] * scale * sqrt(h)),
     clamped to [0, 1], rounded to 6 decimals, non-decreasing per row.
   - Deterministic: no randomness, no network, no time dependence.
 """
 import json
 import math
 import os
+from datetime import datetime
 from pathlib import Path
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-# Quantiles of the 85% N(0, 0.014^2) + 15% N(0, 0.08^2) mixture, per
+# Quantiles of the 85% N(0, 0.014^2) + 15% N(0, 0.10^2) mixture, per
 # sqrt-minute, in logit units. Precomputed by bisection on the mixture CDF.
-Z_MIX = [-0.038344, -0.011022, 0.0, 0.011022, 0.038344]
+Z_MIX = [-0.04429, -0.011112, 0.0, 0.011112, 0.04429]
 MR_WINDOW = 1440        # minutes of history the mean reverts toward (24h)
 MR_RATE = 0.05          # per hour toward the window mean logit
 # Level-dependent spread: the logit spread scales with the price level.
@@ -42,6 +51,24 @@ MR_RATE = 0.05          # per hour toward the window mean logit
 # move). Tested k in [-5, +2]; k=-3.5 is best (0.2776 vs 0.2813 at k=0).
 LEVEL_K = -3.5
 LEVEL_FLOOR = 0.2
+# Age-dependent spread: scale *= 1 + AGE_K / sqrt(age_hours). Younger
+# markets are more volatile (see docstring). Tested k in [0, 2]; 0.6 best.
+AGE_K = 0.6
+
+
+def parse_time(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def age_hours(start, at):
+    a = parse_time(start)
+    b = parse_time(at)
+    if a is None or b is None:
+        return 24.0
+    return max((b - a).total_seconds() / 3600.0, 0.1)
 
 
 def logit(p):
@@ -60,7 +87,7 @@ def price6(x):
     return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0.0
 
 
-def forecast_market(prices, horizon):
+def forecast_market(prices, horizon, age_h):
     x = prices[-1]
     lx = logit(x)
     # mean logit of the last MR_WINDOW minutes (or all history if shorter)
@@ -68,9 +95,10 @@ def forecast_market(prices, horizon):
     mean_logit = sum(logit(v) for v in hist) / len(hist)
     drift = (mean_logit - lx) * MR_RATE  # logit drift per hour
     # level-dependent spread (see LEVEL_K): narrower near p=0.5, wider
-    # near 0 or 1.
+    # near 0 or 1; then age-dependent spread (see AGE_K): younger wider.
     lev = x * (1.0 - x)
     scale = max(1.0 + LEVEL_K * (lev - 0.125), LEVEL_FLOOR)
+    scale *= 1.0 + AGE_K / math.sqrt(age_h)
     rows = []
     for h in range(1, horizon + 1):
         center = lx + drift * h / 60.0
@@ -92,7 +120,14 @@ def main():
         if case["quantiles"] != QUANTILES:
             raise ValueError(f"{path.name} asks for {case['quantiles']}")
         forecasts = [
-            {"id": m["id"], "q": forecast_market(m["prices"], case["horizon_minutes"])}
+            {
+                "id": m["id"],
+                "q": forecast_market(
+                    m["prices"],
+                    case["horizon_minutes"],
+                    age_hours(m.get("start", ""), case.get("at", "")),
+                ),
+            }
             for m in case["markets"]
         ]
         (out_dir / f"{path.stem}.out").write_text(
