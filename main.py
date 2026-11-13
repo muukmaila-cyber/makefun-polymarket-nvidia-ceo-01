@@ -5,11 +5,17 @@ baseline 0.363589, top dev entry 0.190):
   - Forecast in logit space: the Yes price is a probability, so a symmetric
     random walk in logit space becomes the right skewed spread in price
     space (a small market can double far more easily than it can halve).
-  - Fixed logit volatility sigma = 0.02 per sqrt-minute for every market
-    (per-market realised vol was tested and is worse: recent vol is noisy
-    and the tiny markets' logit vol blows up).
+  - Fixed logit volatility sigma = 0.02 per sqrt-minute for every market.
+    Tested and rejected on the practice cases: per-market realised vol
+    (6h window, 0.380; per-market logit vol, 0.293-0.318), a wider or
+    narrower fixed sigma (0.0015: 0.333; 0.0035: 0.407), asymmetric
+    quantile shapes in price space (0.376-0.414), and a horizon exponent
+    other than sqrt (alpha 0.4: 0.300; 0.6: 0.303). Recent realised vol is
+    too noisy and the tiny markets' logit vol blows up; a single fixed
+    sigma is the most robust choice.
   - Mild mean reversion: the centre drifts 5% per hour toward the mean
-    logit of the last 6 hours (news jumps partially revert).
+    logit of the last 6 hours (news jumps partially revert). Tested:
+    no reversion 0.2893, 5%/h 0.2848, 10%/h 0.2864, 20%/h 0.3053.
   - q_tau(h) = sigmoid(logit(x) + drift*h/60 + z_tau * 0.02 * sqrt(h)),
     clamped to [0, 1], rounded to 6 decimals, non-decreasing per row.
   - Deterministic: no randomness, no network, no time dependence.
