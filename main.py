@@ -1,22 +1,24 @@
 """Polymarket next-NVIDIA-CEO forecaster (Python 3.13, stdlib only).
 
-Method (validated on the 6 practice cases, pinball loss 0.2848 vs house
-baseline 0.363589, top dev entry 0.190):
+Method (validated on the 6 practice cases, pinball loss 0.2813 vs house
+baseline 0.363589, top dev entry 0.190, v1 0.2848):
   - Forecast in logit space: the Yes price is a probability, so a symmetric
     random walk in logit space becomes the right skewed spread in price
     space (a small market can double far more easily than it can halve).
-  - Fixed logit volatility sigma = 0.02 per sqrt-minute for every market.
-    Tested and rejected on the practice cases: per-market realised vol
-    (6h window, 0.380; per-market logit vol, 0.293-0.318), a wider or
-    narrower fixed sigma (0.0015: 0.333; 0.0035: 0.407), asymmetric
-    quantile shapes in price space (0.376-0.414), and a horizon exponent
-    other than sqrt (alpha 0.4: 0.300; 0.6: 0.303). Recent realised vol is
-    too noisy and the tiny markets' logit vol blows up; a single fixed
-    sigma is the most robust choice.
+  - Two-component normal mixture in logit space, per sqrt-minute:
+    85% narrow (sigma 0.014) + 15% wide (sigma 0.08). The mixture's
+    quantiles are Z_MIX below (precomputed by bisection on the mixture CDF,
+    verified CDF(Z_MIX) == tau). This gives a narrow centre with heavy
+    tails, matching the data: median |240-min move| is only 0.003, but
+    5.5% of market-cases jump >0.05 and the max is 0.223. A single normal
+    is too wide in the centre and too narrow in the tails; a Student-t and
+    per-market / global realised vol were tested and are worse (realised
+    vol overestimates future vol).
   - Mild mean reversion: the centre drifts 5% per hour toward the mean
-    logit of the last 6 hours (news jumps partially revert). Tested:
-    no reversion 0.2893, 5%/h 0.2848, 10%/h 0.2864, 20%/h 0.3053.
-  - q_tau(h) = sigmoid(logit(x) + drift*h/60 + z_tau * 0.02 * sqrt(h)),
+    logit of the last 24 hours (1440 min). A 24h anchor beats 6h (0.2848)
+    and 48h/72h (0.288/0.292); the price reverts toward its longer-term
+    level, not just the last few hours.
+  - q_tau(h) = sigmoid(logit(x) + drift*h/60 + Z_MIX[tau] * sqrt(h)),
     clamped to [0, 1], rounded to 6 decimals, non-decreasing per row.
   - Deterministic: no randomness, no network, no time dependence.
 """
@@ -28,9 +30,10 @@ from pathlib import Path
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
-SIGMA = 0.02            # logit volatility per sqrt-minute (fixed)
-MR_WINDOW = 360         # minutes of history the mean reverts toward
+# Quantiles of the 85% N(0, 0.014^2) + 15% N(0, 0.08^2) mixture, per
+# sqrt-minute, in logit units. Precomputed by bisection on the mixture CDF.
+Z_MIX = [-0.038344, -0.011022, 0.0, 0.011022, 0.038344]
+MR_WINDOW = 1440        # minutes of history the mean reverts toward (24h)
 MR_RATE = 0.05          # per hour toward the window mean logit
 
 
@@ -60,8 +63,8 @@ def forecast_market(prices, horizon):
     rows = []
     for h in range(1, horizon + 1):
         center = lx + drift * h / 60.0
-        s = SIGMA * math.sqrt(h)
-        row = [price6(sigmoid(center + z * s)) for z in Z]
+        sh = math.sqrt(h)
+        row = [price6(sigmoid(center + z * sh)) for z in Z_MIX]
         for j in range(1, 5):
             if row[j] < row[j - 1]:
                 row[j] = row[j - 1]
