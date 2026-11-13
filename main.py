@@ -1,7 +1,7 @@
 """Polymarket next-NVIDIA-CEO forecaster (Python 3.13, stdlib only).
 
-Method (validated on the 6 practice cases, pinball loss 0.2813 vs house
-baseline 0.363589, top dev entry 0.190, v1 0.2848):
+Method (validated on the 6 practice cases, pinball loss 0.2776 vs house
+baseline 0.363589, top dev entry 0.190, v1 0.2848, v2 0.2813):
   - Forecast in logit space: the Yes price is a probability, so a symmetric
     random walk in logit space becomes the right skewed spread in price
     space (a small market can double far more easily than it can halve).
@@ -35,6 +35,13 @@ QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_MIX = [-0.038344, -0.011022, 0.0, 0.011022, 0.038344]
 MR_WINDOW = 1440        # minutes of history the mean reverts toward (24h)
 MR_RATE = 0.05          # per hour toward the window mean logit
+# Level-dependent spread: the logit spread scales with the price level.
+# scale = 1 - 3.5 * (p*(1-p) - 0.125), floored at 0.2. A market near
+# p=0.5 gets scale ~0.56 (narrower: its logit is anchored), a market near
+# 0 or 1 gets scale up to ~1.4 (wider: a small price move is a big logit
+# move). Tested k in [-5, +2]; k=-3.5 is best (0.2776 vs 0.2813 at k=0).
+LEVEL_K = -3.5
+LEVEL_FLOOR = 0.2
 
 
 def logit(p):
@@ -60,11 +67,15 @@ def forecast_market(prices, horizon):
     hist = prices[-MR_WINDOW:]
     mean_logit = sum(logit(v) for v in hist) / len(hist)
     drift = (mean_logit - lx) * MR_RATE  # logit drift per hour
+    # level-dependent spread (see LEVEL_K): narrower near p=0.5, wider
+    # near 0 or 1.
+    lev = x * (1.0 - x)
+    scale = max(1.0 + LEVEL_K * (lev - 0.125), LEVEL_FLOOR)
     rows = []
     for h in range(1, horizon + 1):
         center = lx + drift * h / 60.0
         sh = math.sqrt(h)
-        row = [price6(sigmoid(center + z * sh)) for z in Z_MIX]
+        row = [price6(sigmoid(center + z * scale * sh)) for z in Z_MIX]
         for j in range(1, 5):
             if row[j] < row[j - 1]:
                 row[j] = row[j - 1]
